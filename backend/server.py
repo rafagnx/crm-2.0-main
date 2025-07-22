@@ -734,3 +734,20 @@ logger = logging.getLogger(__name__)
 @app.on_event("shutdown")
 async def shutdown_db_client():
     client.close()
+
+    # ... outras importações e configurações ...
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000", # Para desenvolvimento local
+        "https://crm-2-0-main.vercel.app" # <--- ADICIONE AQUI A URL DO SEU FRONTEND NO VERCEL
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ... restante do seu código FastAPI ...
