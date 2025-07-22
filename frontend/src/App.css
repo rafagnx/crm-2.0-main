@@ -1,0 +1,193 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+.App {
+  text-align: left;
+}
+
+/* Custom Kanban Styles */
+.kanban-column {
+  min-width: 300px;
+  max-width: 300px;
+}
+
+.lead-card {
+  transition: all 0.2s ease;
+}
+
+.lead-card:hover {
+  transform: translateY(-2px);
+}
+
+.lead-card.dragging {
+  opacity: 0.5;
+  transform: rotate(5deg);
+}
+
+/* Loading animation */
+.loading-spinner {
+  border: 4px solid #f3f3f3;
+  border-top: 4px solid #3498db;
+  border-radius: 50%;
+  width: 40px;
+  height: 40px;
+  animation: spin 2s linear infinite;
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+/* Custom scrollbar for horizontal kanban */
+.overflow-x-auto::-webkit-scrollbar {
+  height: 8px;
+}
+
+.overflow-x-auto::-webkit-scrollbar-track {
+  background: #f1f1f1;
+  border-radius: 10px;
+}
+
+.overflow-x-auto::-webkit-scrollbar-thumb {
+  background: #888;
+  border-radius: 10px;
+}
+
+.overflow-x-auto::-webkit-scrollbar-thumb:hover {
+  background: #555;
+}
+
+/* Modal backdrop */
+.modal-backdrop {
+  backdrop-filter: blur(4px);
+}
+
+/* Form animations */
+.form-input {
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.form-input:focus {
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+}
+
+/* Button hover effects */
+.btn {
+  transition: all 0.2s ease;
+}
+
+.btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+
+/* Status colors for leads */
+.status-novo {
+  border-left-color: #3b82f6;
+}
+
+.status-qualificado {
+  border-left-color: #10b981;
+}
+
+.status-proposta {
+  border-left-color: #f59e0b;
+}
+
+.status-negociacao {
+  border-left-color: #ef4444;
+}
+
+.status-fechado-ganho {
+  border-left-color: #059669;
+}
+
+.status-fechado-perdido {
+  border-left-color: #6b7280;
+}
+
+/* Responsive design */
+@media (max-width: 768px) {
+  .kanban-column {
+    min-width: 280px;
+    max-width: 280px;
+  }
+}
+
+/* Dark mode support */
+@media (prefers-color-scheme: dark) {
+  .App {
+    background-color: #1a1a1a;
+    color: #ffffff;
+  }
+}
+
+/* Animation for card creation */
+.new-card-animation {
+  animation: slideInUp 0.3s ease-out;
+}
+
+@keyframes slideInUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Drag and drop visual feedback */
+.drag-over {
+  background-color: #eff6ff;
+  border: 2px dashed #3b82f6;
+}
+
+.dragging {
+  opacity: 0.5;
+  transform: rotate(3deg);
+}
+
+/* Success and error messages */
+.success-message {
+  background-color: #d1fae5;
+  border: 1px solid #a7f3d0;
+  color: #065f46;
+}
+
+.error-message {
+  background-color: #fee2e2;
+  border: 1px solid #fca5a5;
+  color: #991b1b;
+}
+
+/* Tag styles */
+.tag {
+  display: inline-block;
+  background-color: #e0e7ff;
+  color: #3730a3;
+  padding: 0.25rem 0.5rem;
+  border-radius: 9999px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  margin: 0.125rem;
+}
+
+.tag.high-priority {
+  background-color: #fee2e2;
+  color: #991b1b;
+}
+
+.tag.medium-priority {
+  background-color: #fef3c7;
+  color: #92400e;
+}
+
+.tag.low-priority {
+  background-color: #d1fae5;
+  color: #065f46;
+}
