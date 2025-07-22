@@ -1,135 +1,102 @@
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from dotenv import load_dotenv
-from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 import os
-import logging
-from pathlib import Path
-from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
-import uuid
+import asyncio
 from datetime import datetime, timedelta
-import jwt
-import bcrypt
-from enum import Enum
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
-from google_auth_oauthlib.flow import Flow
-import json
+from typing import Optional, List
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from motor.motor_asyncio import AsyncIOMotorClient
+from bson import ObjectId
+import uvicorn
 
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+# Configurações
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-here-change-in-production")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+# Configuração do MongoDB
+MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
+DATABASE_NAME = os.getenv("DATABASE_NAME", "crm_kanban")
 
-# Create the main app without a prefix
-app = FastAPI(title="CRM Kanban API", version="1.0.0")
-
-# Create a router with the /api prefix
-api_router = APIRouter(prefix="/api")
-
-# JWT Configuration
-JWT_SECRET = os.environ.get('JWT_SECRET', 'your-secret-key-change-in-production')
-JWT_ALGORITHM = 'HS256'
-JWT_EXPIRATION_HOURS = 24 * 7  # 7 days
-
-# Google Calendar Configuration
-GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID')
-GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET')
-GOOGLE_SCOPES = ['https://www.googleapis.com/auth/calendar']
-
+# Configuração de senha
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 
-# Enums
-class UserRole(str, Enum):
-    ADMIN = "admin"
-    MANAGER = "manager"
-    USER = "user"
+# Inicialização do FastAPI
+app = FastAPI(title="CRM Kanban API", version="1.0.0")
 
-class LeadStatus(str, Enum):
-    NEW = "novo"
-    QUALIFIED = "qualificado"
-    PROPOSAL = "proposta"
-    NEGOTIATION = "negociacao"
-    CLOSED_WON = "fechado_ganho"
-    CLOSED_LOST = "fechado_perdido"
+# Configuração CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Em produção, especifique os domínios permitidos
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-class EventType(str, Enum):
-    FOLLOW_UP = "follow_up"
-    MEETING = "meeting"
-    CALL = "call"
-    DEMO = "demo"
+# Cliente MongoDB
+client = None
+db = None
 
-# Models
-class User(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    email: str
-    name: str
-    password_hash: str
-    role: UserRole = UserRole.USER
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    is_active: bool = True
-    google_tokens: Optional[Dict] = None
+@app.on_event("startup")
+async def startup_db_client():
+    global client, db
+    try:
+        client = AsyncIOMotorClient(MONGODB_URL)
+        db = client[DATABASE_NAME]
+        # Teste a conexão
+        await client.admin.command('ping')
+        print(f"Conectado ao MongoDB: {DATABASE_NAME}")
+    except Exception as e:
+        print(f"Erro ao conectar ao MongoDB: {e}")
+        raise
 
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    if client:
+        client.close()
+
+# Modelos Pydantic
 class UserCreate(BaseModel):
-    email: str
     name: str
+    email: EmailStr
     password: str
-    role: UserRole = UserRole.USER
+    role: str = "user"
 
 class UserLogin(BaseModel):
-    email: str
+    email: EmailStr
     password: str
 
 class UserResponse(BaseModel):
     id: str
-    email: str
     name: str
-    role: UserRole
+    email: str
+    role: str
     created_at: datetime
-    is_active: bool
 
-class Lead(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    title: str
-    company: str = ""
-    contact_name: str = ""
-    email: str = ""
-    phone: str = ""
-    status: LeadStatus = LeadStatus.NEW
-    tags: List[str] = []
-    notes: str = ""
-    value: float = 0.0
-    priority: str = "medium"  # low, medium, high
-    assigned_to: str = ""  # User ID
-    created_by: str = ""   # User ID
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
-    position: int = 0  # For drag & drop ordering
-    next_follow_up: Optional[datetime] = None
-    expected_close_date: Optional[datetime] = None
-    source: str = ""  # website, referral, cold_call, etc.
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user: UserResponse
 
 class LeadCreate(BaseModel):
     title: str
-    company: str = ""
-    contact_name: str = ""
-    email: str = ""
-    phone: str = ""
-    status: LeadStatus = LeadStatus.NEW
+    company: Optional[str] = None
+    contact_name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    status: str = "novo"
     tags: List[str] = []
-    notes: str = ""
+    notes: Optional[str] = None
     value: float = 0.0
     priority: str = "medium"
-    assigned_to: str = ""
+    assigned_to: Optional[str] = None
+    source: Optional[str] = None
     next_follow_up: Optional[datetime] = None
     expected_close_date: Optional[datetime] = None
-    source: str = ""
 
 class LeadUpdate(BaseModel):
     title: Optional[str] = None
@@ -137,617 +104,442 @@ class LeadUpdate(BaseModel):
     contact_name: Optional[str] = None
     email: Optional[str] = None
     phone: Optional[str] = None
-    status: Optional[LeadStatus] = None
+    status: Optional[str] = None
     tags: Optional[List[str]] = None
     notes: Optional[str] = None
     value: Optional[float] = None
     priority: Optional[str] = None
     assigned_to: Optional[str] = None
-    position: Optional[int] = None
+    source: Optional[str] = None
     next_follow_up: Optional[datetime] = None
     expected_close_date: Optional[datetime] = None
-    source: Optional[str] = None
 
-class Activity(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+class KanbanMove(BaseModel):
     lead_id: str
-    user_id: str
-    action: str
-    details: str = ""
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
-
-class AutomationRule(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    name: str
-    trigger_status: LeadStatus
-    action: str  # create_task, send_email, schedule_follow_up
-    action_params: Dict = {}
-    created_by: str
-    is_active: bool = True
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-
-class AutomationRuleCreate(BaseModel):
-    name: str
-    trigger_status: LeadStatus
-    action: str
-    action_params: Dict = {}
+    new_status: str
+    new_position: int
 
 class CalendarEvent(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    lead_id: str
-    user_id: str
     title: str
-    description: str = ""
+    description: Optional[str] = None
     start_time: datetime
-    end_time: datetime
-    event_type: EventType
-    google_event_id: Optional[str] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    end_time: Optional[datetime] = None
+    event_type: str = "meeting"
+    lead_id: Optional[str] = None
 
-class CalendarEventCreate(BaseModel):
-    lead_id: str
-    title: str
-    description: str = ""
-    start_time: datetime
-    end_time: datetime
-    event_type: EventType
+# Funções utilitárias
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
 
-class KanbanColumn(BaseModel):
-    status: LeadStatus
-    title: str
-    color: str
-    leads: List[Lead] = []
+def get_password_hash(password):
+    return pwd_context.hash(password)
 
-# Authentication helpers
-def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-
-def verify_password(password: str, hashed: str) -> bool:
-    return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
-
-def create_jwt_token(user_id: str, email: str, role: str) -> str:
-    payload = {
-        'user_id': user_id,
-        'email': email,
-        'role': role,
-        'exp': datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS)
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
-def verify_jwt_token(token: str) -> Dict:
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    payload = verify_jwt_token(credentials.credentials)
-    user = await db.users.find_one({"id": payload["user_id"]})
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
-    return User(**user)
-
-# Google Calendar helpers
-async def get_google_calendar_service(user: User):
-    if not user.google_tokens:
-        return None
-    
-    creds = Credentials(
-        token=user.google_tokens.get('access_token'),
-        refresh_token=user.google_tokens.get('refresh_token'),
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=GOOGLE_CLIENT_ID,
-        client_secret=GOOGLE_CLIENT_SECRET,
-        scopes=GOOGLE_SCOPES
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
     )
-    
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        # Update tokens in database
-        await db.users.update_one(
-            {"id": user.id},
-            {"$set": {"google_tokens": {
-                "access_token": creds.token,
-                "refresh_token": creds.refresh_token
-            }}}
-        )
-    
-    return build('calendar', 'v3', credentials=creds)
-
-async def create_google_event(service, event_data: CalendarEvent):
-    event = {
-        'summary': event_data.title,
-        'description': event_data.description,
-        'start': {
-            'dateTime': event_data.start_time.isoformat(),
-            'timeZone': 'America/Sao_Paulo',
-        },
-        'end': {
-            'dateTime': event_data.end_time.isoformat(),
-            'timeZone': 'America/Sao_Paulo',
-        },
-    }
-    
     try:
-        result = service.events().insert(calendarId='primary', body=event).execute()
-        return result.get('id')
-    except Exception as e:
-        logging.error(f"Error creating Google Calendar event: {e}")
-        return None
-
-# Automation helpers
-async def process_automation_rules(lead_id: str, new_status: LeadStatus, user_id: str):
-    """Process automation rules when a lead changes status"""
-    rules = await db.automation_rules.find({"trigger_status": new_status, "is_active": True}).to_list(100)
+        token = credentials.credentials
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
     
-    for rule_data in rules:
-        rule = AutomationRule(**rule_data)
-        
-        if rule.action == "schedule_follow_up":
-            # Schedule automatic follow-up
-            follow_up_date = datetime.utcnow() + timedelta(days=rule.action_params.get('days', 3))
-            await db.leads.update_one(
-                {"id": lead_id},
-                {"$set": {"next_follow_up": follow_up_date}}
-            )
-            
-            # Log activity
-            activity = Activity(
-                lead_id=lead_id,
-                user_id=user_id,
-                action="automated_follow_up_scheduled",
-                details=f"Follow-up automatically scheduled for {follow_up_date.strftime('%Y-%m-%d')}"
-            )
-            await db.activities.insert_one(activity.dict())
-        
-        elif rule.action == "create_task":
-            # Create a task/activity
-            activity = Activity(
-                lead_id=lead_id,
-                user_id=user_id,
-                action="automated_task_created",
-                details=rule.action_params.get('task_description', 'Automated task created')
-            )
-            await db.activities.insert_one(activity.dict())
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    if user is None:
+        raise credentials_exception
+    return user
 
-# Authentication Routes
-@api_router.post("/auth/register")
+def serialize_doc(doc):
+    """Converte ObjectId para string em documentos MongoDB"""
+    if doc is None:
+        return None
+    if isinstance(doc, list):
+        return [serialize_doc(item) for item in doc]
+    if isinstance(doc, dict):
+        result = {}
+        for key, value in doc.items():
+            if key == "_id":
+                result["id"] = str(value)
+            elif isinstance(value, ObjectId):
+                result[key] = str(value)
+            elif isinstance(value, dict):
+                result[key] = serialize_doc(value)
+            elif isinstance(value, list):
+                result[key] = serialize_doc(value)
+            else:
+                result[key] = value
+        return result
+    return doc
+
+# Rotas de autenticação
+@app.post("/api/auth/register", response_model=Token)
 async def register(user_data: UserCreate):
-    # Check if user exists
+    # Verificar se o usuário já existe
     existing_user = await db.users.find_one({"email": user_data.email})
     if existing_user:
-        raise HTTPException(status_code=400, detail="Email already registered")
+        raise HTTPException(
+            status_code=400,
+            detail="Email already registered"
+        )
     
-    # Hash password
-    hashed_password = hash_password(user_data.password)
+    # Criar novo usuário
+    hashed_password = get_password_hash(user_data.password)
+    user_doc = {
+        "name": user_data.name,
+        "email": user_data.email,
+        "password": hashed_password,
+        "role": user_data.role,
+        "created_at": datetime.utcnow()
+    }
     
-    # Create user
-    user = User(
-        email=user_data.email,
-        name=user_data.name,
-        password_hash=hashed_password,
-        role=user_data.role
+    result = await db.users.insert_one(user_doc)
+    user_doc["_id"] = result.inserted_id
+    
+    # Criar token de acesso
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": str(result.inserted_id)}, expires_delta=access_token_expires
     )
     
-    await db.users.insert_one(user.dict())
+    user_response = UserResponse(
+        id=str(result.inserted_id),
+        name=user_doc["name"],
+        email=user_doc["email"],
+        role=user_doc["role"],
+        created_at=user_doc["created_at"]
+    )
     
-    # Create JWT token
-    token = create_jwt_token(user.id, user.email, user.role.value)
-    
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "user": UserResponse(**user.dict())
-    }
+    return Token(access_token=access_token, token_type="bearer", user=user_response)
 
-@api_router.post("/auth/login")
+@app.post("/api/auth/login", response_model=Token)
 async def login(user_data: UserLogin):
-    # Find user
+    # Verificar se o usuário existe
     user = await db.users.find_one({"email": user_data.email})
-    if not user or not verify_password(user_data.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not user or not verify_password(user_data.password, user["password"]):
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect email or password"
+        )
     
-    if not user["is_active"]:
-        raise HTTPException(status_code=401, detail="Account deactivated")
+    # Criar token de acesso
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": str(user["_id"])}, expires_delta=access_token_expires
+    )
     
-    # Create JWT token
-    token = create_jwt_token(user["id"], user["email"], user["role"])
+    user_response = UserResponse(
+        id=str(user["_id"]),
+        name=user["name"],
+        email=user["email"],
+        role=user["role"],
+        created_at=user["created_at"]
+    )
     
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "user": UserResponse(**user)
+    return Token(access_token=access_token, token_type="bearer", user=user_response)
+
+@app.get("/api/auth/me", response_model=UserResponse)
+async def get_current_user_info(current_user: dict = Depends(get_current_user)):
+    return UserResponse(
+        id=str(current_user["_id"]),
+        name=current_user["name"],
+        email=current_user["email"],
+        role=current_user["role"],
+        created_at=current_user["created_at"]
+    )
+
+# Rotas de leads
+@app.post("/api/leads")
+async def create_lead(lead_data: LeadCreate, current_user: dict = Depends(get_current_user)):
+    lead_doc = lead_data.dict()
+    lead_doc["created_by"] = str(current_user["_id"])
+    lead_doc["created_at"] = datetime.utcnow()
+    lead_doc["updated_at"] = datetime.utcnow()
+    lead_doc["position"] = 0  # Posição no kanban
+    
+    result = await db.leads.insert_one(lead_doc)
+    lead_doc["_id"] = result.inserted_id
+    
+    # Log da atividade
+    activity = {
+        "user_id": str(current_user["_id"]),
+        "lead_id": str(result.inserted_id),
+        "action": "created",
+        "details": f"Lead '{lead_data.title}' foi criado",
+        "timestamp": datetime.utcnow()
     }
+    await db.activities.insert_one(activity)
+    
+    return serialize_doc(lead_doc)
 
-@api_router.get("/auth/me", response_model=UserResponse)
-async def get_me(current_user: User = Depends(get_current_user)):
-    return UserResponse(**current_user.dict())
+@app.get("/api/leads")
+async def get_leads(current_user: dict = Depends(get_current_user)):
+    leads = await db.leads.find({"created_by": str(current_user["_id"])}).to_list(1000)
+    return serialize_doc(leads)
 
-# Google Calendar OAuth Routes
-@api_router.get("/auth/google/connect")
-async def connect_google_calendar(current_user: User = Depends(get_current_user)):
-    """Initiate Google Calendar OAuth flow"""
-    flow = Flow.from_client_config(
-        {
-            "web": {
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token"
-            }
-        },
-        scopes=GOOGLE_SCOPES
-    )
-    
-    flow.redirect_uri = f"https://89088de9-de4f-40fb-b5f4-8abb04375e5b.preview.emergentagent.com/api/auth/google/callback"
-    
-    authorization_url, state = flow.authorization_url(
-        access_type='offline',
-        include_granted_scopes='true',
-        state=current_user.id
-    )
-    
-    return {"authorization_url": authorization_url}
+@app.get("/api/leads/{lead_id}")
+async def get_lead(lead_id: str, current_user: dict = Depends(get_current_user)):
+    try:
+        lead = await db.leads.find_one({
+            "_id": ObjectId(lead_id),
+            "created_by": str(current_user["_id"])
+        })
+        if not lead:
+            raise HTTPException(status_code=404, detail="Lead not found")
+        return serialize_doc(lead)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid lead ID")
 
-@api_router.get("/auth/google/callback")
-async def google_calendar_callback(code: str, state: str):
-    """Handle Google Calendar OAuth callback"""
-    flow = Flow.from_client_config(
-        {
-            "web": {
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token"
-            }
-        },
-        scopes=GOOGLE_SCOPES
-    )
-    
-    flow.redirect_uri = f"https://89088de9-de4f-40fb-b5f4-8abb04375e5b.preview.emergentagent.com/api/auth/google/callback"
-    flow.fetch_token(code=code)
-    
-    credentials = flow.credentials
-    
-    # Save tokens to user
-    await db.users.update_one(
-        {"id": state},
-        {"$set": {"google_tokens": {
-            "access_token": credentials.token,
-            "refresh_token": credentials.refresh_token
-        }}}
-    )
-    
-    return {"message": "Google Calendar connected successfully"}
+@app.put("/api/leads/{lead_id}")
+async def update_lead(lead_id: str, lead_data: LeadUpdate, current_user: dict = Depends(get_current_user)):
+    try:
+        update_data = {k: v for k, v in lead_data.dict().items() if v is not None}
+        update_data["updated_at"] = datetime.utcnow()
+        
+        result = await db.leads.update_one(
+            {"_id": ObjectId(lead_id), "created_by": str(current_user["_id"])},
+            {"$set": update_data}
+        )
+        
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Lead not found")
+        
+        updated_lead = await db.leads.find_one({"_id": ObjectId(lead_id)})
+        
+        # Log da atividade
+        activity = {
+            "user_id": str(current_user["_id"]),
+            "lead_id": lead_id,
+            "action": "updated",
+            "details": f"Lead '{updated_lead['title']}' foi atualizado",
+            "timestamp": datetime.utcnow()
+        }
+        await db.activities.insert_one(activity)
+        
+        return serialize_doc(updated_lead)
+    except Exception as e:
+        if "Lead not found" in str(e):
+            raise e
+        raise HTTPException(status_code=400, detail="Invalid lead ID")
 
-# User Routes
-@api_router.get("/users", response_model=List[UserResponse])
-async def get_users(current_user: User = Depends(get_current_user)):
-    users = await db.users.find({"is_active": True}).to_list(1000)
-    return [UserResponse(**user) for user in users]
+@app.delete("/api/leads/{lead_id}")
+async def delete_lead(lead_id: str, current_user: dict = Depends(get_current_user)):
+    try:
+        lead = await db.leads.find_one({
+            "_id": ObjectId(lead_id),
+            "created_by": str(current_user["_id"])
+        })
+        
+        if not lead:
+            raise HTTPException(status_code=404, detail="Lead not found")
+        
+        await db.leads.delete_one({"_id": ObjectId(lead_id)})
+        
+        # Log da atividade
+        activity = {
+            "user_id": str(current_user["_id"]),
+            "lead_id": lead_id,
+            "action": "deleted",
+            "details": f"Lead '{lead['title']}' foi excluído",
+            "timestamp": datetime.utcnow()
+        }
+        await db.activities.insert_one(activity)
+        
+        return {"message": "Lead deleted successfully"}
+    except Exception as e:
+        if "Lead not found" in str(e):
+            raise e
+        raise HTTPException(status_code=400, detail="Invalid lead ID")
 
-# Lead Routes
-@api_router.post("/leads", response_model=Lead)
-async def create_lead(lead_data: LeadCreate, current_user: User = Depends(get_current_user)):
-    lead = Lead(**lead_data.dict(), created_by=current_user.id)
-    
-    # Get max position for the status
-    max_position = await db.leads.find_one(
-        {"status": lead.status}, 
-        sort=[("position", -1)]
-    )
-    if max_position:
-        lead.position = max_position["position"] + 1
-    
-    await db.leads.insert_one(lead.dict())
-    
-    # Log activity
-    activity = Activity(
-        lead_id=lead.id,
-        user_id=current_user.id,
-        action="created",
-        details=f"Lead '{lead.title}' created"
-    )
-    await db.activities.insert_one(activity.dict())
-    
-    # Process automation rules
-    await process_automation_rules(lead.id, lead.status, current_user.id)
-    
-    return lead
-
-@api_router.get("/leads", response_model=List[Lead])
-async def get_leads(
-    status: Optional[str] = None,
-    assigned_to: Optional[str] = None,
-    priority: Optional[str] = None,
-    current_user: User = Depends(get_current_user)
-):
-    query = {}
-    if status:
-        query["status"] = status
-    if assigned_to:
-        query["assigned_to"] = assigned_to
-    if priority:
-        query["priority"] = priority
-    
-    leads = await db.leads.find(query).sort("position", 1).to_list(1000)
-    return [Lead(**lead) for lead in leads]
-
-@api_router.get("/leads/{lead_id}", response_model=Lead)
-async def get_lead(lead_id: str, current_user: User = Depends(get_current_user)):
-    lead = await db.leads.find_one({"id": lead_id})
-    if not lead:
-        raise HTTPException(status_code=404, detail="Lead not found")
-    return Lead(**lead)
-
-@api_router.put("/leads/{lead_id}", response_model=Lead)
-async def update_lead(
-    lead_id: str, 
-    lead_update: LeadUpdate, 
-    current_user: User = Depends(get_current_user)
-):
-    lead = await db.leads.find_one({"id": lead_id})
-    if not lead:
-        raise HTTPException(status_code=404, detail="Lead not found")
-    
-    # Update fields
-    update_data = {k: v for k, v in lead_update.dict().items() if v is not None}
-    update_data["updated_at"] = datetime.utcnow()
-    
-    old_status = lead["status"]
-    new_status = update_data.get("status", old_status)
-    
-    await db.leads.update_one(
-        {"id": lead_id},
-        {"$set": update_data}
-    )
-    
-    # Get updated lead
-    updated_lead = await db.leads.find_one({"id": lead_id})
-    
-    # Log activity
-    activity = Activity(
-        lead_id=lead_id,
-        user_id=current_user.id,
-        action="updated",
-        details=f"Lead updated"
-    )
-    await db.activities.insert_one(activity.dict())
-    
-    # Process automation rules if status changed
-    if old_status != new_status:
-        await process_automation_rules(lead_id, new_status, current_user.id)
-    
-    return Lead(**updated_lead)
-
-@api_router.delete("/leads/{lead_id}")
-async def delete_lead(lead_id: str, current_user: User = Depends(get_current_user)):
-    result = await db.leads.delete_one({"id": lead_id})
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Lead not found")
-    
-    # Log activity
-    activity = Activity(
-        lead_id=lead_id,
-        user_id=current_user.id,
-        action="deleted",
-        details=f"Lead deleted"
-    )
-    await db.activities.insert_one(activity.dict())
-    
-    return {"message": "Lead deleted successfully"}
-
-# Kanban Board Routes
-@api_router.get("/kanban", response_model=List[KanbanColumn])
-async def get_kanban_board(current_user: User = Depends(get_current_user)):
-    # Define column structure
+# Rotas do Kanban
+@app.get("/api/kanban")
+async def get_kanban_data(current_user: dict = Depends(get_current_user)):
+    # Definir as colunas do kanban
     columns = [
-        {"status": LeadStatus.NEW, "title": "Novo", "color": "#3B82F6"},
-        {"status": LeadStatus.QUALIFIED, "title": "Qualificado", "color": "#10B981"},
-        {"status": LeadStatus.PROPOSAL, "title": "Proposta", "color": "#F59E0B"},
-        {"status": LeadStatus.NEGOTIATION, "title": "Negociação", "color": "#EF4444"},
-        {"status": LeadStatus.CLOSED_WON, "title": "Fechado (Ganho)", "color": "#059669"},
-        {"status": LeadStatus.CLOSED_LOST, "title": "Fechado (Perdido)", "color": "#6B7280"}
+        {"status": "novo", "title": "Novo", "color": "#3B82F6"},
+        {"status": "qualificado", "title": "Qualificado", "color": "#10B981"},
+        {"status": "proposta", "title": "Proposta", "color": "#F59E0B"},
+        {"status": "negociacao", "title": "Negociação", "color": "#EF4444"},
+        {"status": "fechado_ganho", "title": "Fechado (Ganho)", "color": "#059669"},
+        {"status": "fechado_perdido", "title": "Fechado (Perdido)", "color": "#6B7280"}
     ]
     
-    kanban_columns = []
+    # Buscar leads para cada coluna
+    kanban_data = []
     for column in columns:
-        leads = await db.leads.find({"status": column["status"]}).sort("position", 1).to_list(1000)
-        kanban_columns.append(KanbanColumn(
-            status=column["status"],
-            title=column["title"],
-            color=column["color"],
-            leads=[Lead(**lead) for lead in leads]
-        ))
+        leads = await db.leads.find({
+            "created_by": str(current_user["_id"]),
+            "status": column["status"]
+        }).sort("position", 1).to_list(1000)
+        
+        kanban_data.append({
+            "status": column["status"],
+            "title": column["title"],
+            "color": column["color"],
+            "leads": serialize_doc(leads)
+        })
     
-    return kanban_columns
+    return kanban_data
 
-@api_router.post("/kanban/move")
-async def move_lead(
-    data: Dict,
-    current_user: User = Depends(get_current_user)
-):
-    lead_id = data.get("lead_id")
-    new_status = data.get("new_status")
-    new_position = data.get("new_position", 0)
-    
-    if not lead_id or not new_status:
-        raise HTTPException(status_code=400, detail="lead_id and new_status are required")
-    
-    # Get old status for automation
-    lead = await db.leads.find_one({"id": lead_id})
-    old_status = lead["status"] if lead else None
-    
-    # Update lead status and position
-    await db.leads.update_one(
-        {"id": lead_id},
-        {"$set": {"status": new_status, "position": new_position, "updated_at": datetime.utcnow()}}
-    )
-    
-    # Log activity
-    activity = Activity(
-        lead_id=lead_id,
-        user_id=current_user.id,
-        action="moved",
-        details=f"Lead moved to {new_status}"
-    )
-    await db.activities.insert_one(activity.dict())
-    
-    # Process automation rules if status changed
-    if old_status != new_status:
-        await process_automation_rules(lead_id, new_status, current_user.id)
-    
-    return {"message": "Lead moved successfully"}
+@app.post("/api/kanban/move")
+async def move_lead(move_data: KanbanMove, current_user: dict = Depends(get_current_user)):
+    try:
+        # Atualizar o status e posição do lead
+        result = await db.leads.update_one(
+            {"_id": ObjectId(move_data.lead_id), "created_by": str(current_user["_id"])},
+            {
+                "$set": {
+                    "status": move_data.new_status,
+                    "position": move_data.new_position,
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+        
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Lead not found")
+        
+        # Buscar o lead atualizado
+        updated_lead = await db.leads.find_one({"_id": ObjectId(move_data.lead_id)})
+        
+        # Log da atividade
+        activity = {
+            "user_id": str(current_user["_id"]),
+            "lead_id": move_data.lead_id,
+            "action": "moved",
+            "details": f"Lead '{updated_lead['title']}' movido para {move_data.new_status}",
+            "timestamp": datetime.utcnow()
+        }
+        await db.activities.insert_one(activity)
+        
+        return {"message": "Lead moved successfully"}
+    except Exception as e:
+        if "Lead not found" in str(e):
+            raise e
+        raise HTTPException(status_code=400, detail="Invalid lead ID")
 
-# Calendar Routes
-@api_router.post("/calendar/events", response_model=CalendarEvent)
-async def create_calendar_event(
-    event_data: CalendarEventCreate, 
-    current_user: User = Depends(get_current_user)
-):
-    event = CalendarEvent(**event_data.dict(), user_id=current_user.id)
+# Rotas do Dashboard
+@app.get("/api/dashboard/stats")
+async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
+    user_id = str(current_user["_id"])
     
-    # Try to create Google Calendar event
-    service = await get_google_calendar_service(current_user)
-    if service:
-        google_event_id = await create_google_event(service, event)
-        event.google_event_id = google_event_id
+    # Total de leads
+    total_leads = await db.leads.count_documents({"created_by": user_id})
     
-    await db.calendar_events.insert_one(event.dict())
-    
-    # Log activity
-    activity = Activity(
-        lead_id=event.lead_id,
-        user_id=current_user.id,
-        action="event_created",
-        details=f"Calendar event '{event.title}' scheduled for {event.start_time.strftime('%Y-%m-%d %H:%M')}"
-    )
-    await db.activities.insert_one(activity.dict())
-    
-    return event
-
-@api_router.get("/calendar/events", response_model=List[CalendarEvent])
-async def get_calendar_events(current_user: User = Depends(get_current_user)):
-    events = await db.calendar_events.find({"user_id": current_user.id}).sort("start_time", 1).to_list(1000)
-    return [CalendarEvent(**event) for event in events]
-
-# Automation Routes
-@api_router.post("/automation/rules", response_model=AutomationRule)
-async def create_automation_rule(
-    rule_data: AutomationRuleCreate,
-    current_user: User = Depends(get_current_user)
-):
-    rule = AutomationRule(**rule_data.dict(), created_by=current_user.id)
-    await db.automation_rules.insert_one(rule.dict())
-    return rule
-
-@api_router.get("/automation/rules", response_model=List[AutomationRule])
-async def get_automation_rules(current_user: User = Depends(get_current_user)):
-    rules = await db.automation_rules.find({"created_by": current_user.id}).to_list(1000)
-    return [AutomationRule(**rule) for rule in rules]
-
-# Activity Routes
-@api_router.get("/leads/{lead_id}/activities", response_model=List[Activity])
-async def get_lead_activities(lead_id: str, current_user: User = Depends(get_current_user)):
-    activities = await db.activities.find({"lead_id": lead_id}).sort("timestamp", -1).to_list(1000)
-    return [Activity(**activity) for activity in activities]
-
-# Advanced Dashboard/Stats Routes
-@api_router.get("/dashboard/stats")
-async def get_dashboard_stats(current_user: User = Depends(get_current_user)):
-    # Count leads by status
+    # Estatísticas por status
     pipeline = [
-        {"$group": {"_id": "$status", "count": {"$sum": 1}, "total_value": {"$sum": "$value"}}}
+        {"$match": {"created_by": user_id}},
+        {
+            "$group": {
+                "_id": "$status",
+                "count": {"$sum": 1},
+                "value": {"$sum": "$value"}
+            }
+        }
     ]
-    status_stats = await db.leads.aggregate(pipeline).to_list(None)
+    status_stats_raw = await db.leads.aggregate(pipeline).to_list(1000)
+    status_stats = {item["_id"]: {"count": item["count"], "value": item["value"]} for item in status_stats_raw}
     
-    # Conversion rates
-    total_leads = await db.leads.count_documents({})
-    closed_won = await db.leads.count_documents({"status": LeadStatus.CLOSED_WON})
-    closed_lost = await db.leads.count_documents({"status": LeadStatus.CLOSED_LOST})
+    # Taxa de conversão
+    fechados_ganhos = status_stats.get("fechado_ganho", {}).get("count", 0)
+    conversion_rate = round((fechados_ganhos / total_leads * 100) if total_leads > 0 else 0, 1)
     
-    conversion_rate = (closed_won / total_leads * 100) if total_leads > 0 else 0
+    # Ticket médio
+    total_value = status_stats.get("fechado_ganho", {}).get("value", 0)
+    avg_deal_size = total_value / fechados_ganhos if fechados_ganhos > 0 else 0
     
-    # Average deal size
-    won_deals = await db.leads.find({"status": LeadStatus.CLOSED_WON}).to_list(None)
-    avg_deal_size = sum(deal.get("value", 0) for deal in won_deals) / len(won_deals) if won_deals else 0
-    
-    # Recent activities
-    recent_activities = await db.activities.find().sort("timestamp", -1).limit(10).to_list(10)
-    
-    # Monthly trends (last 6 months)
-    from datetime import datetime, timedelta
-    six_months_ago = datetime.utcnow() - timedelta(days=180)
-    monthly_pipeline = [
-        {"$match": {"created_at": {"$gte": six_months_ago}}},
-        {"$group": {
-            "_id": {
-                "year": {"$year": "$created_at"},
-                "month": {"$month": "$created_at"}
-            },
-            "leads_created": {"$sum": 1},
-            "total_value": {"$sum": "$value"}
-        }},
-        {"$sort": {"_id.year": 1, "_id.month": 1}}
-    ]
-    monthly_trends = await db.leads.aggregate(monthly_pipeline).to_list(None)
-    
-    # Top performing sources
-    source_pipeline = [
-        {"$group": {"_id": "$source", "count": {"$sum": 1}, "total_value": {"$sum": "$value"}}},
+    # Top fontes
+    pipeline_sources = [
+        {"$match": {"created_by": user_id}},
+        {
+            "$group": {
+                "_id": "$source",
+                "count": {"$sum": 1},
+                "total_value": {"$sum": "$value"}
+            }
+        },
         {"$sort": {"count": -1}},
         {"$limit": 5}
     ]
-    top_sources = await db.leads.aggregate(source_pipeline).to_list(None)
+    top_sources = await db.leads.aggregate(pipeline_sources).to_list(5)
+    
+    # Atividades recentes
+    recent_activities = await db.activities.find(
+        {"user_id": user_id}
+    ).sort("timestamp", -1).limit(10).to_list(10)
     
     return {
-        "status_stats": {item["_id"]: {"count": item["count"], "value": item["total_value"]} for item in status_stats},
         "total_leads": total_leads,
-        "conversion_rate": round(conversion_rate, 2),
-        "avg_deal_size": round(avg_deal_size, 2),
-        "recent_activities": [Activity(**activity) for activity in recent_activities],
-        "monthly_trends": monthly_trends,
-        "top_sources": top_sources
+        "conversion_rate": conversion_rate,
+        "avg_deal_size": avg_deal_size,
+        "status_stats": status_stats,
+        "top_sources": top_sources,
+        "recent_activities": serialize_doc(recent_activities)
     }
 
-# Include the router in the main app
-app.include_router(api_router)
+# Rotas do Calendário
+@app.get("/api/calendar/events")
+async def get_calendar_events(current_user: dict = Depends(get_current_user)):
+    events = await db.calendar_events.find({
+        "created_by": str(current_user["_id"])
+    }).sort("start_time", 1).to_list(1000)
+    return serialize_doc(events)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+@app.post("/api/calendar/events")
+async def create_calendar_event(event_data: CalendarEvent, current_user: dict = Depends(get_current_user)):
+    event_doc = event_data.dict()
+    event_doc["created_by"] = str(current_user["_id"])
+    event_doc["created_at"] = datetime.utcnow()
+    
+    result = await db.calendar_events.insert_one(event_doc)
+    event_doc["_id"] = result.inserted_id
+    
+    return serialize_doc(event_doc)
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Rota de conectar Google Calendar (placeholder)
+@app.get("/api/auth/google/connect")
+async def connect_google_calendar(current_user: dict = Depends(get_current_user)):
+    # Esta é uma implementação placeholder
+    # Em uma implementação real, você configuraria OAuth2 com Google
+    return {
+        "authorization_url": "https://accounts.google.com/oauth/authorize",
+        "message": "Google Calendar integration not implemented yet"
+    }
 
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
+# Rota raiz
+@app.get("/")
+async def root():
+    return {"message": "CRM Kanban API is running"}
 
-    # ... outras importações e configurações ...
+@app.get("/api/")
+async def api_root():
+    return {"message": "CRM Kanban API v1.0.0", "status": "active"}
 
-from fastapi.middleware.cors import CORSMiddleware
+# Rota de health check
+@app.get("/api/health")
+async def health_check():
+    try:
+        # Testar conexão com o banco
+        await client.admin.command('ping')
+        return {"status": "healthy", "database": "connected"}
+    except Exception as e:
+        return {"status": "unhealthy", "database": "disconnected", "error": str(e)}
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000", # Para desenvolvimento local
-        "https://crm-2-0-main.vercel.app" # <--- ADICIONE AQUI A URL DO SEU FRONTEND NO VERCEL
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
-# ... restante do seu código FastAPI ...
